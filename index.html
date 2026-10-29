@@ -84,6 +84,12 @@ input[type=color]{width:36px;height:30px;border:1px solid var(--line);border-rad
       </div>
     </div>
 
+    <div class="card">
+      <h2>作った壁紙を修正</h2>
+      <div class="row"><button id="openWp">保存済みの壁紙を開く</button></div>
+      <p class="hint">このツールで保存した画像を上下に分けて読み込みます。差し替えたい側だけ「画像を選択」で入れ替えてください。PNGで保存したものなら画質を落とさずに作り直せます。</p>
+    </div>
+
     <div class="card slot-card" data-slot="0">
       <h2>上の画像 <button class="pick">画像を選択</button></h2>
       <div class="row"><label>拡大</label><input type="range" class="zoom" min="-200" max="400" value="0" step="1"></div>
@@ -136,6 +142,7 @@ input[type=color]{width:36px;height:30px;border:1px solid var(--line);border-rad
   </aside>
 </main>
 <input type="file" id="file" accept="image/*" class="hidden">
+<input type="file" id="wpFile" accept="image/*" class="hidden">
 
 <script>
 'use strict';
@@ -307,6 +314,10 @@ async function decode(file) {
 }
 async function loadFile(i, file) {
   if (!file) return;
+  const meta = await readMeta(file);
+  if (meta && confirm('このツールで作った壁紙です。上下に分けて読み込みますか？\n（キャンセルするとこの枠に1枚の画像として入れます）')) {
+    return loadWallpaper(file, meta);
+  }
   let img;
   try { img = await decode(file); }
   catch (e) { alert('この画像は読み込めませんでした（HEICなど非対応形式の可能性）。JPEG/PNG/WebP をお試しください。'); return; }
@@ -316,6 +327,84 @@ async function loadFile(i, file) {
   fill(i);
   refresh();
 }
+
+// ---------- 保存済み壁紙の再読み込み（修正用） ----------
+// PNG保存時に tEXt チャンクへレイアウト情報を埋め込み、読み込み時に復元する
+const META_KEY = 'wallpaper-maker';
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let j = 0; j < 8; j++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+  return t;
+})();
+function crc32(bytes) {
+  let c = 0xffffffff;
+  for (const b of bytes) c = CRC_TABLE[(c ^ b) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+async function addMeta(blob) {
+  const buf = new Uint8Array(await blob.arrayBuffer());
+  const text = new TextEncoder().encode(META_KEY + '\0' + JSON.stringify({ v: 1, W, H, gap, gapColor, bgColor }));
+  const chunk = new Uint8Array(12 + text.length), dv = new DataView(chunk.buffer);
+  dv.setUint32(0, text.length);
+  chunk.set([0x74, 0x45, 0x58, 0x74], 4); // "tEXt"
+  chunk.set(text, 8);
+  dv.setUint32(8 + text.length, crc32(chunk.subarray(4, 8 + text.length)));
+  const iend = buf.length - 12; // IEND チャンクは末尾12バイト
+  return new Blob([buf.subarray(0, iend), chunk, buf.subarray(iend)], { type: 'image/png' });
+}
+async function readMeta(file) {
+  try {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    if (buf[0] !== 0x89 || buf[1] !== 0x50) return null;
+    const dv = new DataView(buf.buffer);
+    for (let pos = 8; pos + 8 <= buf.length;) {
+      const len = dv.getUint32(pos), type = String.fromCharCode(...buf.subarray(pos + 4, pos + 8));
+      if (type === 'tEXt') {
+        const txt = new TextDecoder('latin1').decode(buf.subarray(pos + 8, pos + 8 + len));
+        if (txt.startsWith(META_KEY + '\0')) return JSON.parse(txt.slice(META_KEY.length + 1));
+      }
+      if (type === 'IEND') break;
+      pos += 12 + len;
+    }
+  } catch (_) {}
+  return null;
+}
+function applyDims(w, h) {
+  W = w; H = h;
+  const key = `${w}x${h}`, sel = $('#preset');
+  sel.value = [...sel.options].some(o => o.value === key) ? key : 'custom';
+  $('#customRow').classList.toggle('hidden', sel.value !== 'custom');
+  $('#outW').value = w; $('#outH').value = h;
+}
+async function loadWallpaper(file, meta) {
+  let img;
+  try { img = await decode(file); }
+  catch (e) { alert('この画像は読み込めませんでした。'); return; }
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  applyDims(iw, ih);
+  if (meta) {
+    gap = Math.max(0, Math.min(200, meta.gap | 0));
+    if (meta.gapColor) gapColor = meta.gapColor;
+    if (meta.bgColor) bgColor = meta.bgColor;
+  }
+  $('#gap').value = gap; $('#gapColor').value = gapColor; $('#bgColor').value = bgColor;
+  const base = file.name.replace(/\.[^.]+$/, '');
+  for (let i = 0; i < 2; i++) {
+    const r = slotRect(i);
+    const part = await createImageBitmap(img, r.x, r.y, r.w, r.h);
+    const s = slots[i];
+    if (s.img && s.img.close) s.img.close();
+    // 原寸・位置ずれなしで置くので、そのまま保存すれば元と同じ絵になる
+    slots[i] = Object.assign(newSlot(), { img: part, name: `${base}（${i ? '下' : '上'}）`, scale: 1 });
+  }
+  if (img.close) img.close();
+  layout(); updateUI();
+}
+$('#openWp').onclick = () => { const f = $('#wpFile'); f.value = ''; f.click(); };
+$('#wpFile').addEventListener('change', async e => {
+  const file = e.target.files[0];
+  if (file) loadWallpaper(file, await readMeta(file));
+});
 
 let pickTarget = 0;
 const fileInput = $('#file');
@@ -487,7 +576,8 @@ function exportBlob() {
   draw(c.getContext('2d'), 1, false);
   const type = $('#format').value;
   return new Promise((res, rej) =>
-    c.toBlob(b => b ? res(b) : rej(new Error('書き出しに失敗しました')), type, +$('#quality').value / 100));
+    c.toBlob(b => b ? res(b) : rej(new Error('書き出しに失敗しました')), type, +$('#quality').value / 100))
+    .then(b => b.type === 'image/png' ? addMeta(b) : b);
 }
 function fileName(blob) {
   const ext = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' }[blob.type] || 'png';
