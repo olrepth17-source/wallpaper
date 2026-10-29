@@ -87,6 +87,7 @@ input[type=color]{width:36px;height:30px;border:1px solid var(--line);border-rad
     <div class="card slot-card" data-slot="0">
       <h2>上の画像 <button class="pick">画像を選択</button></h2>
       <div class="row"><label>拡大</label><input type="range" class="zoom" min="-200" max="400" value="0" step="1"></div>
+      <div class="row"><label>回転</label><input type="range" class="angle" min="-180" max="180" value="0" step="0.1"><button class="rot0">0°</button></div>
       <div class="row">
         <button class="fill">画面いっぱい</button>
         <button class="fit">全体表示</button>
@@ -100,6 +101,7 @@ input[type=color]{width:36px;height:30px;border:1px solid var(--line);border-rad
     <div class="card slot-card" data-slot="1">
       <h2>下の画像 <button class="pick">画像を選択</button></h2>
       <div class="row"><label>拡大</label><input type="range" class="zoom" min="-200" max="400" value="0" step="1"></div>
+      <div class="row"><label>回転</label><input type="range" class="angle" min="-180" max="180" value="0" step="0.1"><button class="rot0">0°</button></div>
       <div class="row">
         <button class="fill">画面いっぱい</button>
         <button class="fit">全体表示</button>
@@ -129,7 +131,7 @@ input[type=color]{width:36px;height:30px;border:1px solid var(--line);border-rad
         <button class="primary" id="save">壁紙を保存</button>
         <button id="share" class="hidden">共有…</button>
       </div>
-      <p class="hint">操作: ドラッグで移動／ホイール・ピンチで拡大縮小／ダブルクリックで画面いっぱいに戻す。空の枠はタップで画像選択、ファイルのドロップも可。</p>
+      <p class="hint">操作: ドラッグで移動／ホイール・ピンチで拡大縮小／2本指でひねる・Shift+ドラッグ・Shift+ホイールで回転（枠の中心が軸）／ダブルクリックで画面いっぱいに戻す。空の枠はタップで画像選択、ファイルのドロップも可。</p>
     </div>
   </aside>
 </main>
@@ -151,12 +153,20 @@ function slotRect(i) {
   const h0 = Math.floor((H - gap) / 2);
   return i === 0 ? { x: 0, y: 0, w: W, h: h0 } : { x: 0, y: h0 + gap, w: W, h: H - h0 - gap };
 }
-function dims(s) {
-  const iw = s.img.naturalWidth || s.img.width, ih = s.img.naturalHeight || s.img.height;
-  return s.rot % 180 ? [ih, iw] : [iw, ih];
+// 回転後でも枠を覆える／枠に収まる倍率（任意角度対応）
+function rotParams(i) {
+  const s = slots[i], r = slotRect(i), a = s.rot * Math.PI / 180;
+  const c = Math.abs(Math.cos(a)), n = Math.abs(Math.sin(a));
+  return { r, c, n, iw: s.img.naturalWidth || s.img.width, ih: s.img.naturalHeight || s.img.height };
 }
-function coverScale(i) { const r = slotRect(i), [w, h] = dims(slots[i]); return Math.max(r.w / w, r.h / h); }
-function containScale(i) { const r = slotRect(i), [w, h] = dims(slots[i]); return Math.min(r.w / w, r.h / h); }
+function coverScale(i) {
+  const { r, c, n, iw, ih } = rotParams(i);
+  return Math.max((r.w * c + r.h * n) / iw, (r.w * n + r.h * c) / ih);
+}
+function containScale(i) {
+  const { r, c, n, iw, ih } = rotParams(i);
+  return Math.min(r.w / (iw * c + ih * n), r.h / (iw * n + ih * c));
+}
 
 function draw(ctx, scale, preview) {
   ctx.setTransform(scale, 0, 0, scale, 0, 0);
@@ -187,6 +197,20 @@ function draw(ctx, scale, preview) {
     }
     ctx.restore();
   });
+  if (preview && rotGuide >= 0 && slots[rotGuide].img) {
+    // 回転中は回転中心（トリミング範囲の中心）を表示
+    const r = slotRect(rotGuide), x = r.x + r.w / 2, y = r.y + r.h / 2, L = W / 30;
+    ctx.save();
+    ctx.setLineDash([]);
+    [['rgba(0,0,0,.6)', 7], ['#fff', 3]].forEach(([col, lw]) => {
+      ctx.strokeStyle = col; ctx.lineWidth = lw;
+      ctx.beginPath();
+      ctx.moveTo(x - L, y); ctx.lineTo(x + L, y); ctx.moveTo(x, y - L); ctx.lineTo(x, y + L);
+      ctx.moveTo(x + L * 0.6, y); ctx.arc(x, y, L * 0.6, 0, Math.PI * 2);
+      ctx.stroke();
+    });
+    ctx.restore();
+  }
   if (gap > 0) {
     ctx.fillStyle = gapColor;
     const r0 = slotRect(0);
@@ -224,6 +248,22 @@ function zoomAt(i, px, py, f) {
   s.cy = oy - (oy - s.cy) * f;
   s.scale = ns;
 }
+// 枠の中心（＝今トリミングしている範囲の中心）を軸に回転
+let rotGuide = -1, guideTimer = 0;
+function showGuide(i, ms) {
+  rotGuide = i; clearTimeout(guideTimer);
+  if (ms) guideTimer = setTimeout(() => { rotGuide = -1; render(); }, ms);
+}
+const normDeg = d => { d = ((d + 180) % 360 + 360) % 360 - 180; return d === -180 ? 180 : d; };
+// 0/90/180°付近では吸着させて、ピンチ時の意図しない傾きを防ぐ
+const snapDeg = d => { const q = Math.round(d / 90) * 90; return Math.abs(d - q) < 1.5 ? q : d; };
+function rotateTo(i, deg) {
+  const s = slots[i], d = (normDeg(deg) - s.rot) * Math.PI / 180;
+  const c = Math.cos(d), n = Math.sin(d);
+  [s.cx, s.cy] = [s.cx * c - s.cy * n, s.cx * n + s.cy * c];
+  s.rot = normDeg(deg);
+}
+let gestureRot = 0; // ジェスチャ中の吸着前の角度
 function fill(i) { const s = slots[i]; if (!s.img) return; s.scale = coverScale(i); s.cx = 0; s.cy = 0; }
 function fit(i) { const s = slots[i]; if (!s.img) return; s.scale = containScale(i); s.cx = 0; s.cy = 0; }
 
@@ -231,14 +271,15 @@ function updateUI() {
   document.querySelectorAll('.slot-card').forEach(card => {
     const i = +card.dataset.slot, s = slots[i];
     const has = !!s.img;
-    card.querySelectorAll('.zoom,.fill,.fit,.rot,.flip,.clear').forEach(el => el.disabled = !has);
+    card.querySelectorAll('.zoom,.angle,.rot0,.fill,.fit,.rot,.flip,.clear').forEach(el => el.disabled = !has);
     const info = card.querySelector('.info');
     if (!has) { info.textContent = '未選択'; return; }
     card.querySelector('.zoom').value = Math.round(Math.log2(s.scale / coverScale(i)) * 100);
+    card.querySelector('.angle').value = s.rot;
     const iw = s.img.naturalWidth || s.img.width, ih = s.img.naturalHeight || s.img.height;
     const pct = (s.scale * 100).toFixed(s.scale < 0.1 ? 1 : 0);
     info.innerHTML = '';
-    info.append(`${s.name}（${iw}×${ih}）・原寸比 ${pct}%`);
+    info.append(`${s.name}（${iw}×${ih}）・原寸比 ${pct}%・角度 ${(+s.rot.toFixed(1))}°`);
     if (s.scale > 1.001) {
       const w = document.createElement('div');
       w.className = 'warn';
@@ -295,6 +336,8 @@ view.addEventListener('pointerdown', e => {
   const p = toOut(e);
   ptrs.set(e.pointerId, p);
   if (ptrs.size === 1) { active = hitSlot(p.y); moved = 0; }
+  gestureRot = slots[active].rot;
+  if (ptrs.size === 2 || e.shiftKey) showGuide(active);
 });
 view.addEventListener('pointermove', e => {
   const prev = ptrs.get(e.pointerId);
@@ -302,7 +345,13 @@ view.addEventListener('pointermove', e => {
   const p = toOut(e), s = slots[active];
   moved += Math.hypot(p.x - prev.x, p.y - prev.y);
   if (s.img) {
-    if (ptrs.size === 1) {
+    const r = slotRect(active), ox = r.x + r.w / 2, oy = r.y + r.h / 2;
+    if (ptrs.size === 1 && e.shiftKey) {
+      // Shift+ドラッグ: 枠の中心のまわりをなぞって回転
+      showGuide(active);
+      gestureRot += (Math.atan2(p.y - oy, p.x - ox) - Math.atan2(prev.y - oy, prev.x - ox)) * 180 / Math.PI;
+      rotateTo(active, snapDeg(normDeg(gestureRot)));
+    } else if (ptrs.size === 1) {
       s.cx += p.x - prev.x; s.cy += p.y - prev.y;
     } else if (ptrs.size === 2) {
       const other = [...ptrs.entries()].find(([id]) => id !== e.pointerId)[1];
@@ -312,6 +361,9 @@ view.addEventListener('pointermove', e => {
       const m1 = { x: (p.x + other.x) / 2, y: (p.y + other.y) / 2 };
       if (d0 > 0) zoomAt(active, m0.x, m0.y, d1 / d0);
       s.cx += m1.x - m0.x; s.cy += m1.y - m0.y;
+      // 2本指のひねりで回転（回転中心は枠の中心）
+      gestureRot += (Math.atan2(p.y - other.y, p.x - other.x) - Math.atan2(prev.y - other.y, prev.x - other.x)) * 180 / Math.PI;
+      rotateTo(active, snapDeg(normDeg(gestureRot)));
     }
     refresh();
   }
@@ -321,6 +373,8 @@ function endPtr(e) {
   if (!ptrs.has(e.pointerId)) return;
   const wasSingle = ptrs.size === 1;
   ptrs.delete(e.pointerId);
+  gestureRot = slots[active].rot;
+  if (!ptrs.size && rotGuide >= 0) { rotGuide = -1; render(); }
   if (wasSingle && e.type === 'pointerup' && moved < W * 0.01 && !slots[active].img) openPicker(active);
 }
 view.addEventListener('pointerup', endPtr);
@@ -329,7 +383,11 @@ view.addEventListener('wheel', e => {
   e.preventDefault();
   const p = toOut(e), i = hitSlot(p.y);
   if (!slots[i].img) return;
-  zoomAt(i, p.x, p.y, Math.exp(-e.deltaY * 0.0015));
+  if (e.shiftKey) {
+    // Shift+ホイール: 回転
+    showGuide(i, 600);
+    rotateTo(i, slots[i].rot + (e.deltaY || e.deltaX) * 0.02);
+  } else zoomAt(i, p.x, p.y, Math.exp(-e.deltaY * 0.0015));
   refresh();
 }, { passive: false });
 view.addEventListener('dblclick', e => { const i = hitSlot(toOut(e).y); fill(i); refresh(); });
@@ -353,8 +411,17 @@ document.querySelectorAll('.slot-card').forEach(card => {
   card.querySelector('.pick').onclick = () => openPicker(i);
   card.querySelector('.fill').onclick = () => { fill(i); refresh(); };
   card.querySelector('.fit').onclick = () => { fit(i); refresh(); };
-  card.querySelector('.rot').onclick = () => { const s = slots[i]; s.rot = (s.rot + 90) % 360; fill(i); refresh(); };
-  card.querySelector('.flip').onclick = () => { const s = slots[i]; s.flip = !s.flip; s.cx = -s.cx; refresh(); };
+  card.querySelector('.rot').onclick = () => {
+    const s = slots[i];
+    rotateTo(i, Math.round(s.rot / 90) * 90 + 90);
+    s.scale = Math.max(s.scale, coverScale(i));
+    refresh();
+  };
+  card.querySelector('.rot0').onclick = () => { rotateTo(i, 0); refresh(); };
+  const angle = card.querySelector('.angle');
+  angle.oninput = () => { if (!slots[i].img) return; showGuide(i); rotateTo(i, snapDeg(+angle.value)); refresh(); };
+  angle.onchange = () => { rotGuide = -1; render(); };
+  card.querySelector('.flip').onclick = () => { const s = slots[i]; s.flip = !s.flip; s.cx = -s.cx; s.rot = normDeg(-s.rot); refresh(); };
   card.querySelector('.clear').onclick = () => {
     const s = slots[i]; if (s.img && s.img.close) s.img.close();
     slots[i] = newSlot(); refresh();
